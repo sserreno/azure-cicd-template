@@ -1,0 +1,53 @@
+# Hourly check of prod's /api/health (docs/adr/0005-health-check-instead-of-monitoring-on-free.md). Opens an issue labelled
+# "health" when it fails and closes it when it recovers. Hourly, not every
+# 15 minutes, to stay inside the 2,000 free Actions minutes of a private repo.
+name: health
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    if: vars.PROD_URL != ''
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      URL: ${{ vars.PROD_URL }}/api/health
+    steps:
+      - name: Check /api/health
+        id: check
+        run: |
+          for _ in 1 2 3; do
+            if body=$(curl -fsS --max-time 60 "$URL"); then
+              echo "ok=true" >> "$GITHUB_OUTPUT"; echo "$body"; exit 0
+            fi
+            sleep 30
+          done
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the health issue
+        if: steps.check.outputs.ok == 'false'
+        run: |
+          gh label create health --color B60205 --description "Production health check" 2>/dev/null || true
+          issue=$(gh issue list --label health --state open --json number --jq '.[0].number')
+          msg="$URL failed at $(date -u +%FT%TZ). Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. If the database used up its free monthly compute on the free tier, it stays paused until the month resets."
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$msg"
+          else
+            gh issue create --label health --title "prod health check failing" --body "$msg"
+          fi
+          exit 1
+
+      - name: Close the health issue
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          for n in $(gh issue list --label health --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Recovered at $(date -u +%FT%TZ)."
+          done

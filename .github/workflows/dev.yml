@@ -1,0 +1,89 @@
+# dev: a merge to main deploys; pull requests get a what-if of infra
+# changes (docs/adr/0004-deploy-with-oidc-and-a-release-branch.md). Azure
+# jobs are skipped until scripts/setup-azure.sh has set the GitHub variables,
+# so a fresh copy of the template runs only the checks.
+name: dev
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/_checks.yml
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.diff.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Manual runs, new branches and unknown bases deploy infra anyway.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ -z "$BASE" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE" "$GITHUB_SHA" -- infra/; then
+            echo "infra=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  what-if:
+    needs: [checks, changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.infra == 'true' && vars.DEV_AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.DEV_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.DEV_AZURE_SUBSCRIPTION_ID }}
+      - name: What-if against dev
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          REGION_CODE: ${{ vars.REGION_CODE || 'sdc' }}
+          TIER: ${{ vars.DEV_TIER || 'free' }}
+          PAID_PLAN_SKU: ${{ vars.PAID_PLAN_SKU || 'B1' }}
+          PAID_SQL_SKU: ${{ vars.PAID_SQL_SKU || 'Basic' }}
+          SQL_ADMIN_GROUP_NAME: ${{ vars.DEV_SQL_ADMIN_GROUP_NAME }}
+          SQL_ADMIN_GROUP_ID: ${{ vars.DEV_SQL_ADMIN_GROUP_ID }}
+          MICROSOFT_AUTH_CLIENT_ID: ${{ vars.DEV_MICROSOFT_AUTH_CLIENT_ID }}
+          GITHUB_AUTH_CLIENT_ID: ${{ vars.DEV_GITHUB_AUTH_CLIENT_ID }}
+          GITHUB_AUTH_CLIENT_SECRET: ${{ secrets.DEV_GITHUB_AUTH_CLIENT_SECRET }}
+          EMAIL_AUTH_CLIENT_ID: ${{ vars.DEV_EMAIL_AUTH_CLIENT_ID }}
+          EMAIL_AUTH_METADATA_URL: ${{ vars.DEV_EMAIL_AUTH_METADATA_URL }}
+          EMAIL_AUTH_CLIENT_SECRET: ${{ secrets.DEV_EMAIL_AUTH_CLIENT_SECRET }}
+        run: |
+          az deployment group what-if \
+            --resource-group "rg-$APP_NAME-dev-$REGION_CODE" \
+            --parameters infra/dev.bicepparam
+
+  deploy:
+    needs: [checks, changes]
+    if: github.event_name != 'pull_request' && vars.DEV_AZURE_CLIENT_ID != ''
+    uses: ./.github/workflows/_deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      env: dev
+      deploy_infra: ${{ needs.changes.outputs.infra == 'true' }}
+    secrets:
+      GITHUB_AUTH_CLIENT_SECRET: ${{ secrets.DEV_GITHUB_AUTH_CLIENT_SECRET }}
+      EMAIL_AUTH_CLIENT_SECRET: ${{ secrets.DEV_EMAIL_AUTH_CLIENT_SECRET }}

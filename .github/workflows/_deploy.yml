@@ -1,0 +1,129 @@
+# Deploys one environment: infrastructure (optional), the SQL firewall,
+# database migrations, then the web app. Called by dev.yml and prod.yml.
+# Resource names follow infra/main.bicep; APP_NAME, REGION_CODE and the
+# <ENV>_TIER variables are set by scripts/setup-azure.sh.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        type: string
+        required: true
+      deploy_infra:
+        type: boolean
+        default: false
+    secrets:
+      # Each is optional: an empty one leaves that sign-in off.
+      GITHUB_AUTH_CLIENT_SECRET:
+        required: false
+      EMAIL_AUTH_CLIENT_SECRET:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  APP_NAME: ${{ vars.APP_NAME }}
+  REGION_CODE: ${{ vars.REGION_CODE || 'sdc' }}
+  RESOURCE_GROUP: rg-${{ vars.APP_NAME }}-${{ inputs.env }}-${{ vars.REGION_CODE || 'sdc' }}
+  WEB_APP: app-${{ vars.APP_NAME }}-${{ inputs.env }}-${{ vars.REGION_CODE || 'sdc' }}
+  APP_IDENTITY_NAME: id-${{ vars.APP_NAME }}-${{ inputs.env }}-app-${{ vars.REGION_CODE || 'sdc' }}
+  SQL_SERVER_NAME: sql-${{ vars.APP_NAME }}-${{ inputs.env }}-${{ vars.REGION_CODE || 'sdc' }}
+  SQL_DATABASE: sqldb-${{ vars.APP_NAME }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ inputs.env }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Build the web app package
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+          npm prune --omit=dev
+          zip -qr "$RUNNER_TEMP/web.zip" package.json dist/src dist/client node_modules
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.env == 'prod' && vars.PROD_AZURE_CLIENT_ID || vars.DEV_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.env == 'prod' && vars.PROD_AZURE_SUBSCRIPTION_ID || vars.DEV_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy infrastructure
+        if: inputs.deploy_infra
+        env:
+          TIER: ${{ inputs.env == 'prod' && vars.PROD_TIER || vars.DEV_TIER || 'free' }}
+          PAID_PLAN_SKU: ${{ vars.PAID_PLAN_SKU || 'B1' }}
+          PAID_SQL_SKU: ${{ vars.PAID_SQL_SKU || 'Basic' }}
+          SQL_ADMIN_GROUP_NAME: ${{ inputs.env == 'prod' && vars.PROD_SQL_ADMIN_GROUP_NAME || vars.DEV_SQL_ADMIN_GROUP_NAME }}
+          SQL_ADMIN_GROUP_ID: ${{ inputs.env == 'prod' && vars.PROD_SQL_ADMIN_GROUP_ID || vars.DEV_SQL_ADMIN_GROUP_ID }}
+          MICROSOFT_AUTH_CLIENT_ID: ${{ inputs.env == 'prod' && vars.PROD_MICROSOFT_AUTH_CLIENT_ID || vars.DEV_MICROSOFT_AUTH_CLIENT_ID }}
+          GITHUB_AUTH_CLIENT_ID: ${{ inputs.env == 'prod' && vars.PROD_GITHUB_AUTH_CLIENT_ID || vars.DEV_GITHUB_AUTH_CLIENT_ID }}
+          GITHUB_AUTH_CLIENT_SECRET: ${{ secrets.GITHUB_AUTH_CLIENT_SECRET }}
+          EMAIL_AUTH_CLIENT_ID: ${{ inputs.env == 'prod' && vars.PROD_EMAIL_AUTH_CLIENT_ID || vars.DEV_EMAIL_AUTH_CLIENT_ID }}
+          EMAIL_AUTH_METADATA_URL: ${{ inputs.env == 'prod' && vars.PROD_EMAIL_AUTH_METADATA_URL || vars.DEV_EMAIL_AUTH_METADATA_URL }}
+          EMAIL_AUTH_CLIENT_SECRET: ${{ secrets.EMAIL_AUTH_CLIENT_SECRET }}
+        run: |
+          echo "Tier: $TIER"
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "main-${GITHUB_RUN_ID}" \
+            --parameters "infra/${{ inputs.env }}.bicepparam" \
+            --output none
+
+      - name: Allow the web app's outbound addresses in the SQL firewall
+        run: scripts/sync-sql-firewall.sh "$RESOURCE_GROUP" "$SQL_SERVER_NAME" "$WEB_APP"
+
+      # The runner's address is allowed only while migrations run.
+      - name: Open SQL firewall for this runner
+        run: |
+          ip=$(curl -fsS https://api.ipify.org)
+          az sql server firewall-rule create \
+            --resource-group "$RESOURCE_GROUP" --server "$SQL_SERVER_NAME" \
+            --name "gha-${GITHUB_RUN_ID}" --start-ip-address "$ip" --end-ip-address "$ip" \
+            --output none
+
+      - name: Apply migrations and ensure the app's database user
+        working-directory: db
+        run: |
+          npm ci
+          token=$(az account get-access-token --resource https://database.windows.net/ --query accessToken --output tsv)
+          echo "::add-mask::$token"
+          SQL_SERVER="$SQL_SERVER_NAME.database.windows.net" \
+          SQL_ACCESS_TOKEN="$token" \
+          APP_IDENTITY_CLIENT_ID=$(az identity show --resource-group "$RESOURCE_GROUP" --name "$APP_IDENTITY_NAME" --query clientId --output tsv) \
+            node migrate.mjs
+
+      - name: Close SQL firewall for this runner
+        if: always()
+        run: |
+          az sql server firewall-rule delete \
+            --resource-group "$RESOURCE_GROUP" --server "$SQL_SERVER_NAME" \
+            --name "gha-${GITHUB_RUN_ID}" --output none || true
+
+      - name: Deploy the web app
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.WEB_APP }}
+          package: ${{ runner.temp }}/web.zip
+
+      - name: Smoke test
+        run: |
+          host=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$WEB_APP" --query defaultHostName --output tsv)
+          # F1 apps sleep when idle and the free database may be resuming.
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 90 "https://$host/api/health"; then exit 0; fi
+            sleep 20
+          done
+          echo "::error::/api/health did not return 200"
+          exit 1

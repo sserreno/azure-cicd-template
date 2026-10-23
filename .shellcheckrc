@@ -1,0 +1,5 @@
+# scripts/setup-azure.sh embeds the /wizard skill's library unchanged:
+# SC2317: library helpers this wizard doesn't call look unreachable.
+# SC1087: false positive on "$e[" in the library's prompt string.
+# SC1091: scripts source the generated, untracked .env.
+disable=SC2317,SC1087,SC1091

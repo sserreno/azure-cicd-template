@@ -1,0 +1,57 @@
+# Fast checks shared by dev.yml and prod.yml. No Azure access.
+name: checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    # A real SQL Server for the tests, migrated from db/migrations.
+    services:
+      sql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Local_Test_1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Local_Test_1 -Q 'SELECT 1' -b"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    # Throwaway credentials for the container above, not a secret.
+    env:
+      SQL_SERVER: localhost
+      SQL_DATABASE: app_test
+      SQL_USER: sa
+      SQL_PASSWORD: Local_Test_1
+      SQL_TRUST_SERVER_CERTIFICATE: 'true'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # Merged migrations are immutable; on a pull request, compare with its base.
+      - name: Merged migrations are unchanged
+        if: github.event_name == 'pull_request'
+        run: scripts/check-migrations-unchanged.sh "${{ github.base_ref }}"
+      - name: Migration tool tests
+        working-directory: db
+        run: npm ci && npm test
+      - name: Migrate the test database
+        working-directory: db
+        run: node migrate.mjs
+      - name: Web app build and tests
+        working-directory: web
+        run: npm ci && npm test
+      - name: Bicep build
+        run: |
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep build --file infra/bootstrap/main.bicep --stdout > /dev/null
+      - name: Shell scripts
+        run: shellcheck scripts/*.sh

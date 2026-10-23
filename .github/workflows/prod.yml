@@ -1,0 +1,43 @@
+# prod: deploys whatever is pushed to the release branch, which only the
+# prod identity's OIDC credential trusts (docs/adr/0004-deploy-with-oidc-and-a-release-branch.md). Push it with
+# scripts/release.sh, which also tags the release.
+name: prod
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Only tagged commits go to prod
+        run: |
+          [ "$GITHUB_REF" = refs/heads/release ] || { echo "::error::prod deploys only from the release branch"; exit 1; }
+          tag=$(git tag --points-at HEAD --list 'v*' | head -n1)
+          [ -n "$tag" ] || { echo "::error::release HEAD has no v* tag; use scripts/release.sh"; exit 1; }
+          echo "Deploying $tag"
+
+  checks:
+    needs: guard
+    uses: ./.github/workflows/_checks.yml
+
+  deploy:
+    needs: checks
+    uses: ./.github/workflows/_deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      env: prod
+      deploy_infra: true
+    secrets:
+      GITHUB_AUTH_CLIENT_SECRET: ${{ secrets.PROD_GITHUB_AUTH_CLIENT_SECRET }}
+      EMAIL_AUTH_CLIENT_SECRET: ${{ secrets.PROD_EMAIL_AUTH_CLIENT_SECRET }}

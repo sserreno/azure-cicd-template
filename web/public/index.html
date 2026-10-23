@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>App</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+    code { background: #f2f2f2; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>It deploys.</h1>
+  <p>This page and <code>/api/health</code> come from the template's sample app in <code>web/</code>. Replace them with your own.</p>
+  <p id="health">Checking the database…</p>
+  <script>
+    fetch('/api/health').then((r) => r.json()).then((h) => {
+      document.getElementById('health').textContent = h.status === 'ok' ? 'Database: connected.' : 'Database: ' + h.error;
+    });
+  </script>
+</body>
+</html>
